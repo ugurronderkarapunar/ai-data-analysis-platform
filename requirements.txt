@@ -1,0 +1,26 @@
+# Core
+streamlit>=1.32.0
+pandas>=2.2.0
+numpy>=1.26.0
+openpyxl>=3.1.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+statsmodels>=0.14.0
+plotly>=5.18.0
+
+# API
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
+
+# Optional forecasting boosters (installed when available)
+xgboost>=2.0.0
+lightgbm>=4.3.0
+
+# Report exports
+reportlab>=4.1.0
+python-pptx>=0.6.23
+
+# Dev / test
+pytest>=8.0.0

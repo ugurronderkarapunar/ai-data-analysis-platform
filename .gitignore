@@ -1,0 +1,40 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
+logs/*.log
+outputs/*
+!outputs/.gitkeep
+data/uploads/
+
+# Model binaries
+models/*.pkl
+models/*.joblib
+models/*.pt
+models/*.h5
+
+# Streamlit
+.streamlit/secrets.toml
