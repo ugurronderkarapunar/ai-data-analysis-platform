@@ -262,6 +262,19 @@ def trend_and_stationarity(
 ) -> Dict[str, Any]:
     """Assess trend and Augmented Dickey-Fuller stationarity when possible.
 
+    Büyük serilerde (örn. yüz binlerce satırlık ham işlem verisi)
+    performans ve bellek sorunlarını önlemek için:
+
+    * Seri, belirli bir üst sınırın (MAX_POINTS_FOR_TREND) üzerindeyse
+      zaman sırası korunarak eşit aralıklarla downsample edilir.
+    * ADF (Augmented Dickey-Fuller) testinde `autolag` KAPALI tutulur
+      ve `maxlag` sabit/makul bir üst sınıra çekilir. Aksi halde
+      statsmodels'in varsayılan davranışı (`maxlag ≈ 12*(n/100)^0.25`,
+      `autolag='AIC'`) büyük n değerlerinde onlarca ayrı OLS
+      regresyonu kurar; bu da işlemi dakikalarca sürebilecek hale
+      getirir ve düşük kaynaklı ortamlarda (örn. Streamlit Community
+      Cloud) uygulamanın donmasına/çökmesine yol açar.
+
     Args:
         series: Time-ordered numeric series.
 
@@ -273,6 +286,17 @@ def trend_and_stationarity(
         if len(clean) < 10:
             return {"available": False, "message": "Trend analizi için yeterli nokta yok."}
 
+        original_length = len(clean)
+        MAX_POINTS_FOR_TREND = 5000
+        if original_length > MAX_POINTS_FOR_TREND:
+            step = original_length // MAX_POINTS_FOR_TREND
+            clean = clean.iloc[::step]
+            logger.info(
+                "Seri %d noktadan %d noktaya düşürüldü (performans amaçlı).",
+                original_length,
+                len(clean),
+            )
+
         x = np.arange(len(clean))
         slope, intercept, r_value, p_value, _ = stats.linregress(x, clean.to_numpy())
         trend = "yukarı" if slope > 0 else "aşağı" if slope < 0 else "yatay"
@@ -281,7 +305,10 @@ def trend_and_stationarity(
         try:
             from statsmodels.tsa.stattools import adfuller
 
-            adf_stat, adf_p, *_ = adfuller(clean)
+            # maxlag sabit ve makul bir üst sınıra çekiliyor; autolag
+            # kapatılıyor ki statsmodels onlarca regresyon denemesin.
+            safe_maxlag = min(20, max(1, len(clean) // 20))
+            adf_stat, adf_p, *_ = adfuller(clean, maxlag=safe_maxlag, autolag=None)
             adf_result = {
                 "available": True,
                 "adf_stat": to_serializable(adf_stat),
