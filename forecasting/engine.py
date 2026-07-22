@@ -25,6 +25,19 @@ HORIZON_MAP: Dict[str, int] = {
     "1y": 365,
 }
 
+# Çok uzun serilerde (örn. yanlışlıkla toplanmamış ham işlem verisi ya da
+# yıllarca süren günlük veri) model eğitimini makul sürede tutmak için
+# kullanılan üst sınır. Aşılırsa serinin en GÜNCEL kısmı kullanılır.
+MAX_POINTS_FOR_FORECAST = 3000
+
+# Ciro (revenue) sütunu otomatik türetilirken aranan miktar/fiyat
+# sütunu adları (küçük harfe çevrilerek karşılaştırılır).
+_QUANTITY_COLUMN_NAMES = {"quantity", "miktar", "adet", "qty"}
+_PRICE_COLUMN_NAMES = {"unitprice", "price", "fiyat", "birim_fiyat", "birimfiyat"}
+
+# Hedef değişken adayı seçilirken dışlanacak ID benzeri sütun kalıpları.
+_ID_LIKE_NAMES = {"id", "index"}
+
 
 @dataclass
 class PreparedSeries:
@@ -66,12 +79,127 @@ def detect_frequency(dates: pd.Series) -> Tuple[str, str]:
         return "unknown", "D"
 
 
+def _maybe_build_revenue_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Derive a revenue column (quantity * price) when possible.
+
+    E-ticaret / satış verilerinde genellikle doğrudan bir "ciro" sütunu
+    bulunmaz; bunun yerine "Quantity" ve "UnitPrice" gibi ayrı sütunlar
+    yer alır. Her ikisi de tespit edilirse, tahmin için çok daha anlamlı
+    olan bir ciro sütunu otomatik olarak türetilir.
+
+    Args:
+        df: Kaynak DataFrame.
+
+    Returns:
+        Tuple[pd.DataFrame, Optional[str]]: (Gerekirse ciro sütunu eklenmiş
+        DataFrame kopyası, türetilen sütunun adı ya da None).
+    """
+    quantity_col = next(
+        (c for c in df.columns if str(c).strip().lower() in _QUANTITY_COLUMN_NAMES),
+        None,
+    )
+    price_col = next(
+        (c for c in df.columns if str(c).strip().lower() in _PRICE_COLUMN_NAMES),
+        None,
+    )
+
+    if quantity_col is None or price_col is None:
+        return df, None
+
+    try:
+        quantity = pd.to_numeric(df[quantity_col], errors="coerce")
+        price = pd.to_numeric(df[price_col], errors="coerce")
+        revenue = quantity * price
+
+        working = df.copy()
+        working["_computed_revenue"] = revenue
+        logger.info(
+            "Ciro sütunu türetildi: '%s' x '%s' -> '_computed_revenue'",
+            quantity_col,
+            price_col,
+        )
+        return working, "_computed_revenue"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ciro sütunu türetilemedi: %s", exc)
+        return df, None
+
+
+def _resolve_value_column(numeric_cols: List[str]) -> Optional[str]:
+    """Pick the most sensible numeric column to forecast.
+
+    Sütun adına göre satış/ciro anahtar kelimelerini tercih eder; bulamazsa
+    ID benzeri (yüksek olasılıkla kimlik) sütunları eleyerek ilk uygun
+    sayısal sütunu döndürür. Bu, örn. "CustomerID" gibi bir kimlik
+    sütununun yanlışlıkla tahmin hedefi olarak seçilmesini engeller.
+
+    Args:
+        numeric_cols: Sayısal sütun adları.
+
+    Returns:
+        Optional[str]: Seçilen sütun adı ya da uygun sütun yoksa None.
+    """
+    if not numeric_cols:
+        return None
+
+    target_keywords = (
+        "ciro", "revenue", "sales", "satis", "satış", "tutar", "amount", "total",
+    )
+    for col in numeric_cols:
+        col_lower = str(col).strip().lower()
+        if any(keyword in col_lower for keyword in target_keywords):
+            return col
+
+    non_id_cols = [
+        col for col in numeric_cols
+        if not (
+            str(col).strip().lower() in _ID_LIKE_NAMES
+            or str(col).strip().lower().endswith(("_id", "id"))
+        )
+    ]
+    return (non_id_cols or numeric_cols)[0]
+
+
+def _limit_series_length(
+    values: np.ndarray, max_points: int = MAX_POINTS_FOR_FORECAST
+) -> np.ndarray:
+    """Trim a series to its most recent `max_points` observations.
+
+    Args:
+        values: Tam zaman serisi değerleri.
+        max_points: İzin verilen azami nokta sayısı.
+
+    Returns:
+        np.ndarray: Gerekirse kısaltılmış seri (en güncel kısım korunur).
+    """
+    if len(values) > max_points:
+        logger.info(
+            "Seri %d noktadan, performans amacıyla son %d noktaya kısaltıldı.",
+            len(values),
+            max_points,
+        )
+        return values[-max_points:]
+    return values
+
+
 def prepare_series(
     df: pd.DataFrame,
     date_col: Optional[str] = None,
     value_col: Optional[str] = None,
 ) -> PreparedSeries:
-    """Prepare a clean univariate time series frame.
+    """Prepare a clean, properly aggregated univariate time series frame.
+
+    Önemli: Bu fonksiyon artık ham (satır bazlı) işlem verisini, tespit
+    edilen frekansa göre TOPLAYARAK (`resample(...).sum()`) gerçek bir
+    zaman serisine dönüştürür. Önceki sürüm yalnızca aynı zaman damgasına
+    sahip satırları `drop_duplicates` ile eleyip sonucu `asfreq` ile
+    zorluyordu; bu, yüz binlerce satırlık ham e-ticaret verisinde gerçek
+    satış toplamlarının kaybolup büyük ölçüde interpolasyonla üretilmiş
+    (uydurma) bir seriye dönüşmesine yol açıyordu.
+
+    Ayrıca, bir "Quantity" ve "UnitPrice" benzeri sütun çifti tespit
+    edilirse otomatik olarak bir ciro (revenue) sütunu türetilip tahmin
+    hedefi olarak tercih edilir; bu da rastgele bir sayısal sütunun
+    (örn. bir kimlik alanının) yanlışlıkla hedef seçilmesini önler.
 
     Args:
         df: Source dataframe.
@@ -85,31 +213,50 @@ def prepare_series(
         ForecastError: If series cannot be prepared.
     """
     try:
-        datetime_cols = [
-            c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])
-        ]
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        dcol = date_col or (datetime_cols[0] if datetime_cols else None)
-        vcol = value_col or (numeric_cols[0] if numeric_cols else None)
-        if dcol is None or vcol is None:
-            raise ForecastError("Tahmin için tarih ve sayısal sütun gerekli.")
+        working_df, computed_revenue_col = _maybe_build_revenue_column(df)
 
-        frame = (
-            df[[dcol, vcol]]
-            .dropna()
-            .assign(**{dcol: lambda x: pd.to_datetime(x[dcol], errors="coerce")})
-            .dropna()
-            .sort_values(dcol)
-            .drop_duplicates(subset=[dcol], keep="last")
-        )
-        if len(frame) < 12:
+        datetime_cols = [
+            c for c in working_df.columns
+            if pd.api.types.is_datetime64_any_dtype(working_df[c])
+        ]
+        numeric_cols = working_df.select_dtypes(include=[np.number]).columns.tolist()
+
+        dcol = date_col or (datetime_cols[0] if datetime_cols else None)
+        if dcol is None:
+            raise ForecastError("Tahmin için tarih sütunu bulunamadı.")
+
+        if value_col and value_col in working_df.columns:
+            vcol = value_col
+        elif computed_revenue_col:
+            vcol = computed_revenue_col
+        else:
+            vcol = _resolve_value_column(numeric_cols)
+
+        if vcol is None:
+            raise ForecastError("Tahmin için uygun sayısal sütun bulunamadı.")
+
+        raw = working_df[[dcol, vcol]].dropna().copy()
+        raw[dcol] = pd.to_datetime(raw[dcol], errors="coerce")
+        raw = raw.dropna(subset=[dcol])
+
+        if len(raw) < 12:
             raise ForecastError("Tahmin için en az 12 zaman noktası gerekir.")
 
-        freq_label, freq_pandas = detect_frequency(frame[dcol])
-        frame = frame.set_index(dcol).asfreq(freq_pandas)
-        frame[vcol] = frame[vcol].interpolate(limit_direction="both")
-        frame = frame.reset_index()
-        return PreparedSeries(frame, dcol, vcol, freq_label, freq_pandas)
+        freq_label, freq_pandas = detect_frequency(raw[dcol])
+
+        aggregated = (
+            raw.set_index(dcol)[vcol]
+            .resample(freq_pandas)
+            .sum()
+            .to_frame()
+            .reset_index()
+        )
+        aggregated[vcol] = aggregated[vcol].interpolate(limit_direction="both")
+
+        if len(aggregated) < 12:
+            raise ForecastError("Tahmin için en az 12 zaman noktası gerekir.")
+
+        return PreparedSeries(aggregated, dcol, vcol, freq_label, freq_pandas)
     except ForecastError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -191,6 +338,8 @@ def evaluate_candidate_models(values: np.ndarray) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Candidate metrics and selected model.
     """
+    values = _limit_series_length(values)
+
     candidates: Dict[str, Any] = {}
     n_splits = min(3, max(2, len(values) // 10))
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -355,8 +504,18 @@ def fit_and_forecast(
         Dict[str, Any]: Forecast values per horizon.
     """
     horizons = horizons or HORIZON_MAP
-    values = prepared.frame[prepared.value_col].to_numpy(dtype=float)
-    last_date = pd.to_datetime(prepared.frame[prepared.date_col].iloc[-1])
+
+    frame = prepared.frame
+    if len(frame) > MAX_POINTS_FOR_FORECAST:
+        logger.info(
+            "Eğitim verisi %d noktadan, performans amacıyla son %d noktaya kısaltıldı.",
+            len(frame),
+            MAX_POINTS_FOR_FORECAST,
+        )
+        frame = frame.tail(MAX_POINTS_FOR_FORECAST).reset_index(drop=True)
+
+    values = frame[prepared.value_col].to_numpy(dtype=float)
+    last_date = pd.to_datetime(frame[prepared.date_col].iloc[-1])
     forecasts: Dict[str, Any] = {}
 
     try:
