@@ -34,7 +34,6 @@ def _init_state() -> None:
     """Initialize Streamlit session state defaults."""
     defaults = {
         "context": None,
-        "orchestrator": None,
         "dark_mode": True,
     }
     for key, value in defaults.items():
@@ -42,16 +41,23 @@ def _init_state() -> None:
             st.session_state[key] = value
 
 
+@st.cache_resource
 def _get_orchestrator() -> OrchestratorAgent:
-    """Return a cached orchestrator instance.
+    """Create a process-wide orchestrator (survives Streamlit reruns).
 
     Returns:
-        OrchestratorAgent: Shared orchestrator.
+        OrchestratorAgent: Shared orchestrator instance.
     """
-    if st.session_state.orchestrator is None:
-        st.session_state.orchestrator = OrchestratorAgent()
-        logger.info("Orchestrator initialized for Streamlit session")
-    return st.session_state.orchestrator
+    try:
+        orchestrator = OrchestratorAgent()
+        logger.info(
+            "Orchestrator cached with %s agents",
+            len(orchestrator.registry.list_agents()),
+        )
+        return orchestrator
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to initialize orchestrator")
+        raise RuntimeError(f"Orchestrator başlatılamadı: {exc}") from exc
 
 
 def main() -> None:

@@ -22,22 +22,31 @@ class AgentRegistry:
         """Initialize an empty registry."""
         self._agents: Dict[str, Type[BaseAgent]] = {}
 
-    def register(self, agent_cls: Type[BaseAgent]) -> None:
-        """Register an agent class.
+    def register(self, agent_cls: Type[BaseAgent], *, replace: bool = True) -> None:
+        """Register an agent class (idempotent for Streamlit reruns).
 
         Args:
             agent_cls: Concrete :class:`BaseAgent` subclass.
+            replace: When True, overwrite an existing registration with the
+                same name. When False, keep the existing registration.
 
         Raises:
-            ValidationError: If the agent name is missing or already registered.
+            ValidationError: If the agent name is missing, or if ``replace`` is
+                False and the name is already registered to a different class.
         """
         name = getattr(agent_cls, "name", None)
         if not name:
             raise ValidationError("Agent class must define a non-empty 'name'.")
         if name in self._agents:
-            raise ValidationError(f"Agent already registered: {name}")
+            existing = self._agents[name]
+            if existing is agent_cls or existing.__name__ == agent_cls.__name__:
+                logger.debug("Agent already registered, skipping: %s", name)
+                return
+            if not replace:
+                raise ValidationError(f"Agent already registered: {name}")
+            logger.warning("Replacing registered agent: %s", name)
         self._agents[name] = agent_cls
-        logger.info("Registered agent: %s", name)
+        logger.debug("Registered agent: %s", name)
 
     def get(self, name: str) -> BaseAgent:
         """Instantiate a registered agent by name.
@@ -59,13 +68,27 @@ class AgentRegistry:
             logger.exception("Failed to instantiate agent %s", name)
             raise ValidationError(f"Cannot create agent '{name}': {exc}") from exc
 
+    def count(self) -> int:
+        """Return the number of registered agents.
+
+        Returns:
+            int: Agent count.
+        """
+        return len(self._agents)
+
     def list_agents(self) -> List[Dict[str, str]]:
-        """List registered agents.
+        """List registered agents without instantiating them.
 
         Returns:
             List[Dict[str, str]]: Agent metadata dictionaries.
         """
-        return [cls().info() for cls in self._agents.values()]
+        return [
+            {
+                "name": str(getattr(cls, "name", cls.__name__)),
+                "description": str(getattr(cls, "description", "")),
+            }
+            for cls in self._agents.values()
+        ]
 
     def has(self, name: str) -> bool:
         """Check whether an agent is registered.
@@ -111,5 +134,5 @@ def build_default_registry() -> AgentRegistry:
         ReportingAgent,
     ):
         registry.register(agent_cls)
-    logger.info("Default registry built with %s agents", len(registry.list_agents()))
+    logger.info("Default registry ready (%s agents)", registry.count())
     return registry
